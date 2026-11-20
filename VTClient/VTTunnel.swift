@@ -28,12 +28,20 @@ final class VTTunnel {
     private var sealer: VTSealer?
     private var reader: VTFrameReader?
 
+    /// 服务器第一帧（ServerHello）常和 salt 挤在同一个 TCP 包里：
+    /// handle() 里 drain() 会立刻拿到明文，但那时 VTProxy 还没把 onData 挂上，
+    /// 直接回调就丢了 → 客户端永远等不到 ServerHello → 连接 abort。先缓冲住。
+    private var pendingOut = Data()
+
     private(set) var state: State = .idle
     private(set) var lastError: String?
 
     var onReady: (() -> Void)?
-    var onData: ((Data) -> Void)?
     var onClose: ((String?) -> Void)?
+
+    var onData: ((Data) -> Void)? {
+        didSet { flushPending() }
+    }
 
     init(relayHost: String, relayPort: UInt16) {
         self.relayHost = relayHost
@@ -209,6 +217,20 @@ final class VTTunnel {
             }
             pushed.append(pt)
         }
-        if !pushed.isEmpty { onData?(pushed) }
+        if pushed.isEmpty { return }
+        if let cb = onData {
+            cb(pushed)
+        } else {
+            pendingOut.append(pushed)
+        }
+    }
+
+    private func flushPending() {
+        io.async { [weak self] in
+            guard let self, let cb = self.onData, !self.pendingOut.isEmpty else { return }
+            let d = self.pendingOut
+            self.pendingOut.removeAll(keepingCapacity: false)
+            cb(d)
+        }
     }
 }
