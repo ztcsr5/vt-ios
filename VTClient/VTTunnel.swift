@@ -81,6 +81,11 @@ final class VTTunnel {
             switch st {
             case .ready:
                 self.io.async {
+                    // 幂等：NWConnection 在某些网络路径上会把 .ready 报不止一次。
+                    // 重发握手会让中继以为又来了一条新隧道，于是在同一条 TCP 上
+                    // 再回一段 128B 响应头 —— 这正是 iOS 侧看到「288B = 128+128+32」
+                    // 而 Node 探针只看到「160B = 128+32」的原因。
+                    guard self.state == .connecting else { return }
                     self.state = .handshaking
                     self.sendHandshake(host: host, port: port)
                 }
