@@ -1,0 +1,29 @@
+name: probe-macos
+on:
+  workflow_dispatch:
+jobs:
+  m13:
+    runs-on: macos-13
+    continue-on-error: true
+    steps:
+      - run: sw_vers; xcodebuild -version
+  m14:
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - run: sw_vers; xcodebuild -version
+  m15:
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - run: sw_vers; xcodebuild -version
+  mlatest:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - run: sw_vers; xcodebuild -version
+  u22:
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - run: uname -a
