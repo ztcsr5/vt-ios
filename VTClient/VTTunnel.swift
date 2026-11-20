@@ -221,8 +221,25 @@ final class VTTunnel {
                 if peeled > 4 { fail("响应段过多"); return }
             }
             guard let hit = VTProto.locateSalt(in: acc) else {
-                diag("可解帧未出现（剥 \(peeled) 段头，余 \(acc.count)B），继续等")
-                if acc.count > 6144 { fail("响应后找不到可解帧") }
+                // 剥完所有响应头后紧跟的一定是服务端 salt（协议规定），
+                // 所以拿不到首帧时按偏移 0 直接建 reader —— 否则会死等：
+                // write() 有 guard state == .ready，state 不 ready 就发不出应用数据，
+                // 服务端没有应用数据就不回帧，locateSalt 于是永远等不到帧头。
+                guard acc.count >= VTProto.saltLen else {
+                    diag("等 salt（已剥 \(peeled) 段头，余 \(acc.count)B）")
+                    return
+                }
+                let salt0 = acc.subdata(in: acc.startIndex..<(acc.startIndex + VTProto.saltLen))
+                let rest0 = Data(acc[(acc.startIndex + VTProto.saltLen)...])
+                diag("按协议取偏移0作 salt（剥 \(peeled) 段头后 余 \(acc.count)B）salt=\(salt0.prefix(8).map { String(format: "%02x", $0) }.joined())…  待解=\(rest0.count)B")
+                acc = Data()
+                reader = VTFrameReader(key: VTProto.subkey(salt: salt0))
+                phase = .data
+                state = .ready
+                if !rest0.isEmpty { reader?.push(rest0) }
+                drain()
+                let cb0 = onReady; onReady = nil
+                queue.async { cb0?() }
                 return
             }
             let serverSalt = acc.subdata(in: (acc.startIndex + hit.saltOffset)..<(acc.startIndex + hit.saltOffset + VTProto.saltLen))
