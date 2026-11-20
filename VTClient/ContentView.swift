@@ -179,6 +179,9 @@ struct ContentView: View {
         var ordered: [(String, UInt16)] = [(node.relayHost, node.relayPort)]
         ordered += relays.filter { $0 != (node.relayHost, node.relayPort) }
 
+        // 把隧道的诊断输出接进日志面板（前缀 VT>）
+        VTDiag.sink = { m in DispatchQueue.main.async { append("VT> " + m) } }
+
         let p = VTProxy(port: listenPort, relays: ordered)
         p.onLog = { m in DispatchQueue.main.async { append(m) } }
         p.onStats = { s in DispatchQueue.main.async { stats = s } }

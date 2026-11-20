@@ -236,3 +236,18 @@ enum VTAuth {
         return String((0..<32).map { _ in cs[Int.random(in: 0..<cs.count)] })
     }
 }
+
+/// 诊断输出的全局出口。ContentView 把它接到日志面板上。
+enum VTDiag {
+    private static let lock = NSLock()
+    private static var _sink: ((String) -> Void)?
+
+    static var sink: ((String) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _sink }
+        set { lock.lock(); _sink = newValue; lock.unlock() }
+    }
+
+    static func emit(_ s: String) {
+        if let f = sink { f(s) } else { print("VT> " + s) }
+    }
+}

@@ -36,6 +36,13 @@ final class VTTunnel {
     private(set) var state: State = .idle
     private(set) var lastError: String?
 
+    /// 诊断输出（打到同一个日志面板，前缀 VT>）
+    static var verbose = true
+    private func diag(_ s: String) {
+        guard VTTunnel.verbose else { return }
+        VTDiag.emit(s)
+    }
+
     var onReady: (() -> Void)?
     var onClose: ((String?) -> Void)?
 
@@ -105,11 +112,13 @@ final class VTTunnel {
             + "Transfer-Encoding: chunked\r\n"
             + "Content-Type: application/octet-stream\r\n\r\n"
 
+        let addrFrame = s.frame(VTAddress.encode(host: host, port: port))
         var payload = Data()
         payload.append(Data(head.utf8))
         payload.append(VTAuth.build(token: VTAuth.randomToken()))  // 60B，缺了必被关
         payload.append(wireSalt)                                    // 32B
-        payload.append(s.frame(VTAddress.encode(host: host, port: port)))
+        payload.append(addrFrame)
+        diag("握手 →\(payload.count)B  head=\(head.utf8.count) auth=60 salt=32 addr=\(addrFrame.count) 目标=\(host):\(port) relay=\(relayHost):\(relayPort)")
         rawSend(payload)
     }
 
@@ -117,7 +126,10 @@ final class VTTunnel {
     func write(_ data: Data) {
         guard !data.isEmpty else { return }
         io.async {
-            guard self.state == .ready, let s = self.sealer else { return }
+            guard self.state == .ready, let s = self.sealer else {
+                self.diag("丢弃 \(data.count)B（state=\(self.state)）")
+                return
+            }
             self.rawSend(s.frame(data))
         }
     }
@@ -159,6 +171,8 @@ final class VTTunnel {
             }
             if let data, !data.isEmpty {
                 self.io.async { self.handle(data) }
+            } else if isDone {
+                self.diag("对端 EOF（state=\(self.state)）")
             }
             if isDone {
                 self.io.async {
@@ -171,6 +185,7 @@ final class VTTunnel {
     }
 
     private func handle(_ chunk: Data) {
+        diag("收到 \(chunk.count)B  phase=\(phase)")
         switch phase {
         case .head:
             acc.append(chunk)
@@ -195,6 +210,7 @@ final class VTTunnel {
             reader = VTFrameReader(key: VTProto.subkey(salt: serverSalt))
             phase = .data
             state = .ready
+            diag("服务端 salt=\(serverSalt.prefix(8).map { String(format: "%02x", $0) }.joined())…  余量=\(acc.count)B")
             if !acc.isEmpty { reader?.push(acc); acc.removeAll(keepingCapacity: false) }
             drain()
             let cb = onReady; onReady = nil
@@ -216,6 +232,10 @@ final class VTTunnel {
                 break
             }
             pushed.append(pt)
+        }
+        if !pushed.isEmpty {
+            let hex = pushed.prefix(12).map { String(format: "%02x", $0) }.joined()
+            diag("解密出 \(pushed.count)B  头部=\(hex)")
         }
         if pushed.isEmpty { return }
         if let cb = onData {
