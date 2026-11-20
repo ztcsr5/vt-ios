@@ -1,0 +1,15 @@
+# 本地测试产物
+_simon/
+_run/
+build/
+swiftc-build/
+Payload/
+*.ipa
+
+# 系统
+.DS_Store
+Thumbs.db
+node_modules/
+
+# 临时
+*.log

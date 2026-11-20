@@ -1,0 +1,119 @@
+name: build-ipa
+
+# 为什么必须 macOS：iOS 的 .app/.ipa 只能由 Apple 的 SDK + 链接器产出，
+# Windows/Linux 上没有合法途径。这个 workflow 做的是"免 Mac 出包"——
+# 用 GitHub 免费的 macOS runner 编译出未签名 IPA，你在 Windows 上用 Sideloadly
+# 配自己的 Apple ID 签名安装（Free provisioning，不需要付费开发者账号）。
+#
+# 两条构建路径：
+#   1) xcodebuild 走 .xcodeproj（正常路径）
+#   2) 手写 pbxproj 万一不被接受，自动降级为 swiftc 直接编译 + 手工组 .app
+#      这条完全不依赖工程文件，只要 6 个 .swift + Info.plist 就能出包。
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 选 Xcode
+        run: |
+          sudo xcode-select -switch /Applications/Xcode.app
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: 列出 scheme（排错用）
+        run: xcodebuild -project VTClient.xcodeproj -list || true
+
+      - name: 构建 A —— xcodebuild 走工程文件
+        id: buildA
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project VTClient.xcodeproj \
+            -scheme VTClient \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            build
+          test -d build/Build/Products/Release-iphoneos/VTClient.app
+
+      - name: 构建 B —— swiftc 直编（A 失败时兜底，不需要 pbxproj）
+        if: steps.buildA.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          OUT="swiftc-build"
+          rm -rf "$OUT" && mkdir -p "$OUT/VTClient.app"
+          xcrun --sdk iphoneos swiftc \
+            -sdk "$SDK" \
+            -target arm64-apple-ios16.0 \
+            -O \
+            -parse-as-library \
+            -module-name VTClient \
+            -o "$OUT/VTClient.app/VTClient" \
+            VTClient/VTCrypto.swift \
+            VTClient/VTTunnel.swift \
+            VTClient/VTProxy.swift \
+            VTClient/KeepAlive.swift \
+            VTClient/SelfTest.swift \
+            VTClient/ContentView.swift
+          PLIST="$OUT/VTClient.app/Info.plist"
+          cp VTClient/Info.plist "$PLIST"
+          # 源 Info.plist 里用的是 xcodebuild 变量（$(EXECUTABLE_NAME) 等），
+          # swiftc 路径没有构建系统替换，必须手工写死，否则装上去直接闪退。
+          setkey() {
+            /usr/libexec/PlistBuddy -c "Set :$1 $2" "$PLIST" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Add :$1 string $2" "$PLIST"
+          }
+          setkey CFBundleExecutable VTClient
+          setkey CFBundleIdentifier com.vt.direct
+          setkey CFBundleName VTClient
+          setkey CFBundlePackageType APPL
+          setkey MinimumOSVersion 16.0
+          setkey CFBundleShortVersionString 1.0.0
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1" "$PLIST" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 1" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:0 integer 1" "$PLIST" 2>/dev/null || true
+          plutil -p "$PLIST"
+          ls -lh "$OUT/VTClient.app/VTClient"
+
+      - name: 打包成 IPA
+        run: |
+          set -euo pipefail
+          rm -rf Payload && mkdir -p Payload
+          if [ -d build/Build/Products/Release-iphoneos/VTClient.app ]; then
+            echo "使用构建 A 产物"
+            cp -R build/Build/Products/Release-iphoneos/VTClient.app Payload/
+          elif [ -d swiftc-build/VTClient.app ]; then
+            echo "使用构建 B 产物"
+            cp -R swiftc-build/VTClient.app Payload/
+          else
+            echo "两条构建路径都没有产物"; find . -name '*.app' -maxdepth 6; exit 1
+          fi
+          zip -qry VTClient-unsigned.ipa Payload
+          ls -lh VTClient-unsigned.ipa
+          shasum -a 256 VTClient-unsigned.ipa
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: VTClient-unsigned-ipa
+          path: VTClient-unsigned.ipa
+          retention-days: 30
