@@ -74,6 +74,56 @@ enum VTProto {
         return c
     }
 
+    /// 在一段字节里自校准找出「服务端 salt」的起点。
+    ///
+    /// 为什么需要这个：中继的响应形状不固定。同一入口实测出现过两种形态 ——
+    ///   `128B 头 + 32B salt`（Node 侧稳定如此）
+    ///   `128B 头 + 32B salt + 又一段 128B 的 HTTP 头`（iOS 侧观察到，288B 总量）
+    /// 任何"剥固定段数"的写法都会在形状变化时静默出错：把 `HTTP/1.1` 的 ASCII
+    /// 当 salt → subkey 全错 → AEAD 校验失败 → 表现为"握手成功但永远没数据"。
+    ///
+    /// 判据用密码学而不是用格式：对每个候选偏移取 32B 当 salt、派生 subkey、
+    /// 用 nonce=0 试解 18B 帧头（2B 长度密文 + 16B tag）。只有真正的 salt 才能
+    /// 解出合法的 2 字节长度（≤ maxReadFrame），错 key 必然 tag 校验失败。
+    /// 返回 (saltOffset, frameOffset)，frameOffset 是首帧的起点。
+    static func locateSalt(in buf: Data) -> (saltOffset: Int, frameOffset: Int)? {
+        let need = saltLen + tagLen + 2
+        guard buf.count >= need else { return nil }
+        let base = buf.startIndex
+        let last = buf.count - need
+        var off = 0
+        while off <= last {
+            let salt = buf.subdata(in: (base + off)..<(base + off + saltLen))
+            let key = subkey(salt: salt)
+            let head = buf.subdata(in: (base + off + saltLen)..<(base + off + saltLen + tagLen + 2))
+            if let n = tryPeekFrameLength(head: head, key: key) {
+                return (off, off + saltLen)
+            }
+            off += 1
+        }
+        return nil
+    }
+
+    /// 用 nonce=0 试解 18B 帧头，成功且长度合法就返回长度。
+    private static func tryPeekFrameLength(head: Data, key: Data) -> Int? {
+        guard head.count == tagLen + 2 else { return nil }
+        let base = head.startIndex
+        let ct = head.subdata(in: base..<(base + 2))
+        let tag = head.subdata(in: (base + 2)..<(base + 2 + tagLen))
+        // 首帧 nonce 全 0；试解不推进任何状态，真正的 nonce 由 VTFrameReader 自己的游标管。
+        let nonceData = Data(repeating: 0, count: nonceLen)
+        do {
+            let box = try ChaChaPoly.SealedBox(nonce: ChaChaPoly.Nonce(data: nonceData), ciphertext: ct, tag: tag)
+            let plain = try ChaChaPoly.open(box, using: SymmetricKey(data: key))
+            guard plain.count == 2 else { return nil }
+            let n = (Int(plain[plain.startIndex]) << 8) | Int(plain[plain.startIndex + 1])
+            guard n >= 0, n <= maxReadFrame else { return nil }
+            return n
+        } catch {
+            return nil
+        }
+    }
+
     /// 小端递增：从字节 0 起进位。
     static func incrementNonce(_ n: inout [UInt8]) {
         for i in 0..<n.count {

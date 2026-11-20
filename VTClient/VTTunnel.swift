@@ -189,32 +189,58 @@ final class VTTunnel {
         switch phase {
         case .head:
             acc.append(chunk)
-            guard let r = acc.range(of: Data("\r\n\r\n".utf8)) else {
-                if acc.count > 8192 { fail("响应头超长") }
+            if VTTunnel.verbose {
+                diag("累积 \(acc.count)B  hex=\(acc.prefix(48).map { String(format: "%02x", $0) }.joined())")
+            }
+            // 中继的响应形状不固定，实测至少两种：
+            //   A) 128B 头 + 32B salt               （Node 侧 _raw443.js 5/5 稳定这样）
+            //   B) 128B 头 + 128B 头 + 32B salt     （iOS 侧观察到，总量正好 288B）
+            // 所以先把开头连续几段 "HTTP/" 响应头全部剥掉（最多 4 段），
+            // 再自校准：扫出「哪个偏移开始的 32 字节能解出合法首帧」。
+            // 只有真正的服务端 salt 才能解出 2B 长度且 ≤16383，错 key 的 tag 必挂。
+            var peeled = 0
+            while true {
+                guard acc.count >= 5 else { return }
+                let isHTTP = acc.prefix(5).elementsEqual(Data("HTTP/".utf8))
+                if !isHTTP { break }
+                guard let r = acc.range(of: Data("\r\n\r\n".utf8)) else {
+                    if acc.count > 16384 { fail("响应头超长") }
+                    return
+                }
+                let segText = String(data: acc[..<r.lowerBound], encoding: .isoLatin1) ?? ""
+                let status = segText.split(separator: "\r\n").first.map(String.init) ?? ""
+                if peeled == 0 {
+                    guard status.contains(" 200") else {
+                        fail("中继拒绝: \(status.isEmpty ? "空响应" : status)")
+                        return
+                    }
+                }
+                diag("剥响应段#\(peeled + 1) 段长=\(r.upperBound) 状态=\(status)")
+                acc = Data(acc[r.upperBound...])
+                peeled += 1
+                if peeled > 4 { fail("响应段过多"); return }
+            }
+            guard let hit = VTProto.locateSalt(in: acc) else {
+                diag("可解帧未出现（剥 \(peeled) 段头，余 \(acc.count)B），继续等")
+                if acc.count > 6144 { fail("响应后找不到可解帧") }
                 return
             }
-            let headStr = String(data: acc[..<r.lowerBound], encoding: .isoLatin1) ?? ""
-            let status = headStr.split(separator: "\r\n").first.map(String.init) ?? ""
-            guard status.contains(" 200") else {
-                fail("中继拒绝: \(status.isEmpty ? "空响应" : status)")
-                return
-            }
-            acc = Data(acc[r.upperBound...])
-            phase = .salt
-            fallthrough
-
-        case .salt:
-            guard acc.count >= VTProto.saltLen else { return }   // 等 salt 到齐
-            let serverSalt = Data(acc.prefix(VTProto.saltLen))    // 服务端 salt 不取反
-            acc = Data(acc.dropFirst(VTProto.saltLen))
+            let serverSalt = acc.subdata(in: (acc.startIndex + hit.saltOffset)..<(acc.startIndex + hit.saltOffset + VTProto.saltLen))
+            let frameBytes = Data(acc[(acc.startIndex + hit.frameOffset)...])
+            diag("自校准成功 salt偏移=\(hit.saltOffset) 帧偏移=\(hit.frameOffset) 余=\(frameBytes.count)B salt=\(serverSalt.prefix(8).map { String(format: "%02x", $0) }.joined())…")
+            acc = Data()
             reader = VTFrameReader(key: VTProto.subkey(salt: serverSalt))
             phase = .data
             state = .ready
-            diag("服务端 salt=\(serverSalt.prefix(8).map { String(format: "%02x", $0) }.joined())…  余量=\(acc.count)B")
-            if !acc.isEmpty { reader?.push(acc); acc.removeAll(keepingCapacity: false) }
+            if !frameBytes.isEmpty { reader?.push(frameBytes) }
             drain()
             let cb = onReady; onReady = nil
             queue.async { cb?() }
+
+        case .salt:
+            // 旧路径，已由 .head 内的自校准取代
+            phase = .data
+            fallthrough
 
         case .data:
             guard let rd = reader else { fail("reader 丢失"); return }
