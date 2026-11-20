@@ -28,6 +28,10 @@ final class VTTunnel {
     private var sealer: VTSealer?
     private var reader: VTFrameReader?
 
+    /// 待发出的明文（攒批用）
+    private var outBuf = Data()
+    private var flushScheduled = false
+
     /// 服务器第一帧（ServerHello）常和 salt 挤在同一个 TCP 包里：
     /// handle() 里 drain() 会立刻拿到明文，但那时 VTProxy 还没把 onData 挂上，
     /// 直接回调就丢了 → 客户端永远等不到 ServerHello → 连接 abort。先缓冲住。
@@ -42,11 +46,14 @@ final class VTTunnel {
     private(set) var state: State = .idle
     private(set) var lastError: String?
 
-    /// 诊断输出（打到同一个日志面板，前缀 VT>）
-    static var verbose = true
-    private func diag(_ s: String) {
+    /// 诊断输出（打到同一个日志面板，前缀 VT>）。
+    /// 默认关 —— 每收一个 TCP 包就打一行、还要在主线程刷一屏 UI，
+    /// 实测能把吞吐压到十分之一。排查时再打开。
+    /// @autoclosure：关着的时候连字符串拼接都不发生。
+    static var verbose = false
+    private func diag(_ s: @autoclosure () -> String) {
         guard VTTunnel.verbose else { return }
-        VTDiag.emit(s)
+        VTDiag.emit(s())
     }
 
     var onReady: (() -> Void)?
@@ -139,21 +146,36 @@ final class VTTunnel {
     }
 
     /// 隧道就绪后写明文，内部自动分帧。
+    /// 攒批：同一轮事件循环里连续多次 write（TLS 一次握手会连发好几个小记录）
+    /// 合并成一批再封帧，减少帧数与 conn.send 次数。
     func write(_ data: Data) {
         guard !data.isEmpty else { return }
         io.async {
-            guard self.state == .ready, let s = self.sealer else {
+            guard self.state == .ready, self.sealer != nil else {
                 self.diag("丢弃 \(data.count)B（state=\(self.state)）")
                 return
             }
-            self.rawSend(s.frame(data))
+            self.outBuf.append(data)
+            if self.flushScheduled { return }
+            self.flushScheduled = true
+            self.io.async { self.flushOut() }
         }
+    }
+
+    private func flushOut() {
+        flushScheduled = false
+        guard !outBuf.isEmpty else { return }
+        let batch = outBuf
+        outBuf.removeAll(keepingCapacity: true)
+        guard state == .ready, let s = sealer else { return }
+        rawSend(s.frame(batch))
     }
 
     func close() {
         io.async {
             guard self.state != .closed else { return }
             self.state = .closed
+            self.outBuf.removeAll(keepingCapacity: false)
             self.conn?.cancel()
             self.conn = nil
         }
@@ -168,6 +190,7 @@ final class VTTunnel {
             guard self.state != .closed, self.state != .failed else { return }
             self.lastError = msg
             self.state = .failed
+            self.outBuf.removeAll(keepingCapacity: false)
             self.conn?.cancel()
             self.conn = nil
             let cb = self.onClose

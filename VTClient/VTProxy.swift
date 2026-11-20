@@ -22,23 +22,50 @@ final class VTProxy {
 
     private let queue = DispatchQueue(label: "vt.proxy", attributes: .concurrent)
     private let stateQueue = DispatchQueue(label: "vt.proxy.state")
+    /// 字节计数走轻量锁，不走 stateQueue.sync。
+    /// 每收一个 TCP 包就 sync 一次串行队列 = 一次上下文切换，
+    /// 满速下载时这条路径每秒被调用上万次，是实测吞吐的首要瓶颈。
+    private let counterLock = NSLock()
+    private var _upBytes = 0
+    private var _downBytes = 0
     private var listener: NWListener?
     private let port: UInt16
 
     /// 中继池：按顺序尝试，成功用哪一个就记住（软粘滞）。
     private let relays: [(String, UInt16)]
     private var preferredRelay = 0
+    /// 每个中继的冷却截止时间（时间戳）。连着失败就进冷却，
+    /// 免得同一条死线路在一轮 18 次尝试里被反复撞 5 遍 —— 那是"越连越慢"的主因。
+    private var cooldownUntil: [TimeInterval] = []
+    private var consecutiveFails: [Int] = []
 
     private var _stats = Stats()
-    var stats: Stats { stateQueue.sync { _stats } }
+    var stats: Stats {
+        var s = stateQueue.sync { _stats }
+        counterLock.lock()
+        s.upBytes = _upBytes
+        s.downBytes = _downBytes
+        counterLock.unlock()
+        return s
+    }
     var onLog: ((String) -> Void)?
     var onStats: ((Stats) -> Void)?
+
+    private func addUp(_ n: Int) {
+        counterLock.lock(); _upBytes += n; counterLock.unlock()
+    }
+
+    private func addDown(_ n: Int) {
+        counterLock.lock(); _downBytes += n; counterLock.unlock()
+    }
 
     private(set) var running = false
 
     init(port: UInt16 = 18890, relays: [(String, UInt16)]) {
         self.port = port
         self.relays = relays
+        self.cooldownUntil = Array(repeating: 0, count: relays.count)
+        self.consecutiveFails = Array(repeating: 0, count: relays.count)
     }
 
     // MARK: - 生命周期
@@ -142,20 +169,58 @@ final class VTProxy {
     }
 
     /// 打开隧道；失败自动换下一个中继（最多试完整个池两轮）。
+    /// 并发握手数受 maxHandshaking 限制：中继对匿名会话有并发上限，
+    /// 小火箭一开一页就能并发几十条，全放进去只会集体 phase=head 超时。
     private func openTunnel(for client: NWConnection,
                             host: String, port: UInt16,
                             then: @escaping (VTTunnel) -> Void) {
-        tryRelay(index: 0, host: host, port: port) { [weak self] tunnel in
+        acquireSlot { [weak self] in
             guard let self else { return }
-            guard let tunnel else {
-                self.finish(client, "所有中继都失败")
-                return
+            self.tryRelay(index: 0, host: host, port: port) { [weak self] tunnel in
+                guard let self else { return }
+                self.releaseSlot()
+                guard let tunnel else {
+                    self.finish(client, "所有中继都失败")
+                    return
+                }
+                self.stateQueue.sync { self._stats.ok += 1 }
+                self.pushStats()
+                then(tunnel)
+                self.trackTunnel(tunnel, client: client)
             }
-            self.stateQueue.sync { self._stats.ok += 1 }
-            self.pushStats()
-            then(tunnel)
-            self.trackTunnel(tunnel, client: client)
         }
+    }
+
+    // MARK: - 握手并发闸门
+
+    private var handshaking = 0
+    private let maxHandshaking = 10
+    private var slotWaiters: [() -> Void] = []
+
+    private func acquireSlot(_ body: @escaping () -> Void) {
+        var runNow = false
+        stateQueue.sync {
+            if handshaking < maxHandshaking {
+                handshaking += 1
+                runNow = true
+            } else {
+                slotWaiters.append(body)
+            }
+        }
+        if runNow { body() }
+    }
+
+    /// 槽位直接转交给下一个等待者，否则才真正释放 —— 保证守恒。
+    private func releaseSlot() {
+        var next: (() -> Void)?
+        stateQueue.sync {
+            if !slotWaiters.isEmpty {
+                next = slotWaiters.removeFirst()
+            } else {
+                handshaking = max(0, handshaking - 1)
+            }
+        }
+        next?()
     }
 
     private func tryRelay(index: Int, host: String, port: UInt16,
@@ -163,6 +228,16 @@ final class VTProxy {
         guard !relays.isEmpty else { done(nil); return }
         guard index < relays.count * 2 else { done(nil); return }
         let i = (preferredRelay + index) % relays.count
+        // 第一轮跳过冷却中的线路；第二轮（index >= count）不再跳，
+        // 否则全池冷却时会直接判定"所有中继都失败"。
+        let relaxed = index >= relays.count
+        let now = Date().timeIntervalSince1970
+        let until = stateQueue.sync { cooldownUntil[i] }
+        if !relaxed, until > now {
+            log("跳过冷却中的中继 \(relays[i].0):\(relays[i].1)（剩 \(Int(until - now))s）")
+            tryRelay(index: index + 1, host: host, port: port, done: done)
+            return
+        }
         let (rh, rp) = relays[i]
         let t = VTTunnel(relayHost: rh, relayPort: rp)
         var settled = false
@@ -171,13 +246,22 @@ final class VTProxy {
             settled = true
             guard let self else { return }
             if success {
-                self.preferredRelay = i
+                self.stateQueue.sync {
+                    self.preferredRelay = i
+                    self.consecutiveFails[i] = 0
+                    self.cooldownUntil[i] = 0
+                }
                 self.log("隧道建立 ← \(rh):\(rp)  → \(host):\(port)")
                 done(t)
             } else {
                 self.stateQueue.sync {
                     self._stats.failed += 1
                     self._stats.lastError = msg ?? "未知错误"
+                    self.consecutiveFails[i] += 1
+                    // 一次就冷却 20s，连续两次 60s —— 死线路不该在一轮里被撞 5 次
+                    let n = self.consecutiveFails[i]
+                    self.cooldownUntil[i] = Date().timeIntervalSince1970
+                        + (n >= 2 ? 60 : 20)
                 }
                 self.pushStats()
                 self.log("中继 \(rh):\(rp) 失败: \(msg ?? "已关闭")")
@@ -193,8 +277,10 @@ final class VTProxy {
     private func pipe(_ client: NWConnection, to tunnel: VTTunnel) {
         tunnel.onData = { [weak self] data in
             guard let self else { return }
-            self.stateQueue.sync { self._stats.downBytes += data.count }
-            client.send(content: data, completion: .contentProcessed { _ in })
+            self.addDown(data.count)
+            // 不用 .contentProcessed 回调：满速时每包一个闭包 + 一次队列跳转，
+            // .idempotent 让 Network 框架自己排队，省掉这条热路径上的分配。
+            client.send(content: data, completion: .idempotent)
         }
         tunnel.onClose = { [weak self] _ in
             guard let self else { client.cancel(); return }
@@ -211,7 +297,7 @@ final class VTProxy {
         client.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isDone, err in
             guard let self else { return }
             if let data, !data.isEmpty {
-                self.stateQueue.sync { self._stats.upBytes += data.count }
+                self.addUp(data.count)
                 tunnel.write(data)
             }
             if err != nil || isDone {

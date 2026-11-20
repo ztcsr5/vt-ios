@@ -176,17 +176,30 @@ final class VTFrameReader {
     private let key: SymmetricKey
     private var nonce = [UInt8](repeating: 0, count: VTProto.nonceLen)
     private var buf = Data()
+    /// 已消费到的位置。**不要用 Data.removeFirst 逐帧裁剪** ——
+    /// Data 是连续内存，removeFirst 会搬移剩余全部字节，
+    /// 持续下载时退化成 O(n²)（桌面 proto.js 就是踩了这个坑，单流 6.43 → 27.04 MB/s）。
+    /// 这里用读游标，攒够一批再一次性压缩，摊还是 O(n)。
+    private var cursor = 0
     private var pending: Int? = nil
     private var failed = false
 
     init(key: Data) { self.key = SymmetricKey(data: key) }
 
-    func push(_ chunk: Data) { buf.append(chunk) }
+    func push(_ chunk: Data) {
+        // 只在「已经消费掉的部分」攒够一批时才压缩一次，把搬移摊薄。
+        // 每帧都 removeFirst 会让宽缓冲的下载退化成 O(n²)。
+        if cursor >= 32768 || (cursor > 0 && buf.count - cursor < 4096) {
+            buf.removeFirst(cursor)
+            cursor = 0
+        }
+        buf.append(chunk)
+    }
 
     /// 解密失败后流已不可恢复，调用方必须断开而不是继续等数据。
     var isFailed: Bool { failed }
     /// 还有多少已收但未消费的字节（调试用）。
-    var bufferedCount: Int { buf.count }
+    var bufferedCount: Int { buf.count - cursor }
 
     private func open(_ cipherAndTag: Data) -> Data? {
         guard cipherAndTag.count >= VTProto.tagLen else { return nil }
@@ -209,12 +222,14 @@ final class VTFrameReader {
     /// 取下一帧明文；数据不足返回 nil（不消耗 nonce）。
     func next() -> Data? {
         if failed { return nil }
+        let avail = buf.count - cursor
         if pending == nil {
             let headLen = 2 + VTProto.tagLen            // 18
-            guard buf.count >= headLen else { return nil }
-            let head = buf.prefix(headLen)
+            guard avail >= headLen else { return nil }
+            let start = buf.startIndex + cursor
+            let head = buf[start..<(start + headLen)]
             guard let lenPt = open(Data(head)) else { return nil }
-            buf.removeFirst(headLen)
+            cursor += headLen
             guard lenPt.count == 2 else { failed = true; return nil }
             let n = (Int(lenPt[lenPt.startIndex]) << 8) | Int(lenPt[lenPt.startIndex + 1])
             if n > VTProto.maxReadFrame { failed = true; return nil }
@@ -222,10 +237,11 @@ final class VTFrameReader {
         }
         guard let n = pending else { return nil }
         let need = n + VTProto.tagLen
-        guard buf.count >= need else { return nil }
-        let body = buf.prefix(need)
+        guard buf.count - cursor >= need else { return nil }
+        let s = buf.startIndex + cursor
+        let body = buf[s..<(s + need)]
         guard let pt = open(Data(body)) else { return nil }
-        buf.removeFirst(need)
+        cursor += need
         pending = nil
         return pt
     }
