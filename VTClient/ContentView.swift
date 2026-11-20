@@ -113,7 +113,7 @@ struct ContentView: View {
                     Button {
                         showSelfTest = true
                     } label: {
-                        Label("协议自检（11 项字节级比对）", systemImage: "checkmark.seal")
+                        Label("协议自检（12 项字节级比对）", systemImage: "checkmark.seal")
                     }
                 } header: {
                     Text("自检")

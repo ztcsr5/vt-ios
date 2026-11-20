@@ -34,9 +34,15 @@ enum VTProto {
     }()
 
     /// HKDF-SHA1(masterKey, salt, "ss-subkey", 32)
+    ///
+    /// extract 的参数顺序是 RFC 5869 里最容易写反的地方，写反了不会报错、
+    /// 只会得到一串"看起来像但完全不对"的 subkey —— 表现为握手成功但对端静默。
+    ///   RFC 5869:  PRK = HMAC-Hash(key = salt, data = IKM)
+    ///   Node 侧:   crypto.hkdfSync('sha1', ikm = masterKey, salt, info, 32)
+    /// 所以 key 必须是 salt、data 必须是 masterKey（2026-11-20 修：原来写反了）。
     static func subkey(salt: Data) -> Data {
         precondition(salt.count == saltLen, "salt 必须 32 字节")
-        let prk = hmacSHA1(key: masterKey, data: salt)   // extract（20 字节）
+        let prk = hmacSHA1(key: salt, data: masterKey)   // extract（20 字节）
         return hmacSHA1Expand(prk: prk, info: hkdfInfo, len: keyLen)
     }
 

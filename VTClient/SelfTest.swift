@@ -87,10 +87,13 @@ enum SelfTest {
                          h(VTProto.invertFirst(salt2)),
                          "ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
 
-        // 切片边界：16384 字节 → 两帧，共 16420 字节
+        // 切片边界：16384 字节 → 两帧。每片线上 = 18(加密长度头) + 明文 + 16(tag)
+        //   片1 明文 16383 → 18 + 16399 = 16417
+        //   片2 明文     1 → 18 +    17 =    35
+        //   合计 16452（与桌面 proto.js 实测一致；原断言写成 16420 是把 tag 漏算了）
         let s3 = VTSealer(key: k)
         let n = s3.frame(Data(repeating: 0x5a, count: VTProto.maxWriteFrame + 1)).count
-        out.append(Case(name: "16384 切两帧 = 16420B", pass: n == 16420, detail: "\(n)"))
+        out.append(Case(name: "16384 切两帧 = 16452B", pass: n == 16452, detail: "\(n)"))
 
         return out
     }
