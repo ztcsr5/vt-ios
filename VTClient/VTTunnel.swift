@@ -154,7 +154,7 @@ final class VTTunnel {
             }
             if isDone {
                 self.io.async {
-                    if self.state == .ready { self.fail(nil) } else { self.fail("中继提前断开") }
+                    if self.state == .ready { self.fail("对端已关闭") } else { self.fail("中继提前断开") }
                 }
                 return
             }

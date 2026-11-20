@@ -125,7 +125,7 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("① 本 App 必须一直开着")
                             .font(.footnote.weight(.semibold))
-                        Text("它是"服务端"：小火箭把流量交给 127.0.0.1:\(String(listenPort))，"
+                        Text("它是「服务端」：小火箭把流量交给 127.0.0.1:\(String(listenPort))，"
                              + "这条监听一旦没了，所有流量就无处可去。已自动开启静音音频保活，"
                              + "可以切后台；但省电模式、低电量、长时间没交互仍可能被系统挂起。")
                             .font(.footnote)
