@@ -33,6 +33,12 @@ final class VTTunnel {
     /// 直接回调就丢了 → 客户端永远等不到 ServerHello → 连接 abort。先缓冲住。
     private var pendingOut = Data()
 
+    /// 硬保护：一条 TCP 上只允许发一次握手。
+    /// NWConnection 的 .ready 在某些路径上会重复回调，仅靠 state 判断不够稳；
+    /// 一旦发两次，中继会在同一条 TCP 上回两段 128B 响应头（288B = 128+128+32），
+    /// 而两次握手用的是两个不同的 salt / token，服务端只认其中一条会话，另一条必被关。
+    private var handshakeSent = false
+
     private(set) var state: State = .idle
     private(set) var lastError: String?
 
@@ -85,7 +91,12 @@ final class VTTunnel {
                     // 重发握手会让中继以为又来了一条新隧道，于是在同一条 TCP 上
                     // 再回一段 128B 响应头 —— 这正是 iOS 侧看到「288B = 128+128+32」
                     // 而 Node 探针只看到「160B = 128+32」的原因。
-                    guard self.state == .connecting else { return }
+                    // 这里除了看 state 还看 handshakeSent：两条判据都过才发。
+                    guard self.state == .connecting, !self.handshakeSent else {
+                        self.diag("跳过重复握手（state=\(self.state) sent=\(self.handshakeSent)）")
+                        return
+                    }
+                    self.handshakeSent = true
                     self.state = .handshaking
                     self.sendHandshake(host: host, port: port)
                 }
